@@ -38,11 +38,26 @@ jobs:
         run: |
           mkdir -p data debug
           if [ ! -f data/dxy_history.csv ]; then
-            echo "datetime_utc,dxy_index,source,dxy_change_pct" > data/dxy_history.csv
+            echo "datetime_utc,dxy_index,source,parse_trace,dxy_change_pct" > data/dxy_history.csv
           fi
+
+      - name: Show scraper version marker
+        run: |
+          echo "=== Marker check ==="
+          grep -n "dom:text-near-last-label" scrape_dxy.py || true
+          grep -n "MAX_DELTA_PER_RUN = 1.0" scrape_dxy.py || true
+          grep -n "Cannot parse strict CNBC Last price" scrape_dxy.py || true
+          echo "=== File head ==="
+          sed -n '1,80p' scrape_dxy.py
 
       - name: Run scraper
         run: python scrape_dxy.py
+
+      - name: Show latest CSV row
+        if: always()
+        run: |
+          echo "=== CSV tail ==="
+          tail -n 5 data/dxy_history.csv || true
 
       - name: Upload debug artifacts
         if: always()
