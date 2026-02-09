@@ -72,3 +72,14 @@ jobs:
 
           echo "Failed to push after 3 attempts."
           exit 1
+          
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxy-debug
+          path: |
+            debug/*.html
+            debug/*.png
+          if-no-files-found: ignore
+
