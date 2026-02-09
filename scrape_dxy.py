@@ -11,7 +11,6 @@ from playwright.sync_api import sync_playwright
 CSV_PATH = "data/dxy_history.csv"
 DEBUG_DIR = "debug"
 
-# CNBC ICE U.S. Dollar Index page
 URLS = ["https://www.cnbc.com/quotes/.DXY"]
 
 USER_AGENTS = [
@@ -22,6 +21,13 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
 ]
+
+# sanity range for DXY
+DXY_MIN = 90.0
+DXY_MAX = 110.0
+
+# 30-min outlier guard
+MAX_DELTA_PER_RUN = 1.0
 
 
 # -------------------------
@@ -47,6 +53,10 @@ def parse_float_safe(s: str) -> Optional[float]:
 
 def now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def in_dxy_range(v: Optional[float]) -> bool:
+    return v is not None and DXY_MIN <= v <= DXY_MAX
 
 
 def save_debug(page, tag: str):
@@ -102,40 +112,23 @@ def get_dxy_synthetic_from_fx() -> float:
 
 
 # -------------------------
-# Strict extractors (avoid wrong 99.99)
+# Strict JSON extractor
 # -------------------------
 def extract_dxy_from_json_text_strict(text: str) -> Optional[float]:
     """
-    Only accept values near .DXY context.
+    Chỉ lấy giá nếu có ngữ cảnh .DXY gần đó để tránh bắt nhầm số khác.
     """
     patterns = [
-        r'"symbol"\s*:\s*"\.DXY".{0,600}?"last(?:Price)?"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
-        r'"last(?:Price)?"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?.{0,600}?"symbol"\s*:\s*"\.DXY"',
-        r'"ticker"\s*:\s*"\.DXY".{0,600}?"last(?:Price)?"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"symbol"\s*:\s*"\.DXY".{0,800}?"last(?:Price)?"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"last(?:Price)?"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?.{0,800}?"symbol"\s*:\s*"\.DXY"',
+        r'"ticker"\s*:\s*"\.DXY".{0,800}?"last(?:Price)?"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"\.DXY".{0,800}?"price"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
     ]
     for pat in patterns:
         m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
         if m:
             v = parse_float_safe(m.group("v"))
-            if v is not None:
-                return round(v, 4)
-    return None
-
-
-def extract_dxy_from_html_strict(html: str) -> Optional[float]:
-    """
-    Parse near known DXY labels in HTML.
-    """
-    ctx_patterns = [
-        r'ICE U\.S\. Dollar Index.{0,900}(?P<v>\d{2,3}\.\d{2,4})',
-        r'\.DXY:Exchange.{0,900}(?P<v>\d{2,3}\.\d{2,4})',
-        r'Last.{0,160}(?P<v>\d{2,3}\.\d{2,4})',
-    ]
-    for pat in ctx_patterns:
-        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
-        if m:
-            v = parse_float_safe(m.group("v"))
-            if v is not None:
+            if in_dxy_range(v):
                 return round(v, 4)
     return None
 
@@ -143,7 +136,7 @@ def extract_dxy_from_html_strict(html: str) -> Optional[float]:
 # -------------------------
 # CNBC scrape
 # -------------------------
-def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
+def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> Tuple[float, str]:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -164,6 +157,7 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
             timezone_id="UTC",
         )
 
+        # light stealth
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
@@ -173,7 +167,7 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
 
         page = context.new_page()
 
-        # block heavy resources
+        # block heavy resources (keep document/js/css/xhr/fetch)
         page.route(
             "**/*",
             lambda route: route.abort()
@@ -181,7 +175,7 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
             else route.continue_(),
         )
 
-        captured_prices = []
+        captured_prices = []  # list[(value, trace)]
 
         def on_response(resp):
             try:
@@ -190,8 +184,8 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
                 if ("json" in ctype) or any(k in u for k in ["quote", "quotes", "chart", "graphql", "api"]):
                     txt = resp.text()
                     v = extract_dxy_from_json_text_strict(txt)
-                    if v is not None:
-                        captured_prices.append(v)
+                    if in_dxy_range(v):
+                        captured_prices.append((v, f"xhr:{u[:140]}"))
             except Exception:
                 pass
 
@@ -206,7 +200,7 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
 
         page.wait_for_timeout(7000)
 
-        # 1) strict DOM selectors around quote strip "Last"
+        # 1) strict DOM selectors (highest priority)
         strict_selectors = [
             '[data-testid="QuoteStrip-lastPrice"]',
             '[data-testid*="QuoteStrip-lastPrice"]',
@@ -220,31 +214,25 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
                 if loc.count() > 0:
                     txt = loc.inner_text(timeout=3000)
                     v = parse_float_safe(txt)
-                    if v is not None and 90 <= v <= 110:
+                    if in_dxy_range(v):
                         browser.close()
-                        return round(v, 4)
+                        return round(v, 4), f"dom:{sel}"
             except Exception:
                 pass
 
-        # 2) captured JSON/XHR with strict .DXY context
-        for v in reversed(captured_prices):
-            if v is not None and 90 <= v <= 110:
+        # 2) strict XHR/JSON candidates
+        for v, tr in reversed(captured_prices):
+            if in_dxy_range(v):
                 browser.close()
-                return round(v, 4)
+                return round(v, 4), tr
 
-        # 3) strict HTML fallback
-        html = page.content()
-        v = extract_dxy_from_html_strict(html)
-        if v is not None and 90 <= v <= 110:
-            browser.close()
-            return round(v, 4)
-
+        # 3) no wide HTML regex fallback to avoid accidental 99.99
         save_debug(page, "cnbc_parse_fail")
         browser.close()
-        raise RuntimeError("Không parse được Last price .DXY từ CNBC")
+        raise RuntimeError("Cannot parse strict .DXY last price from CNBC")
 
 
-def scrape_cnbc_with_retry(max_rounds=4) -> Tuple[float, str]:
+def scrape_cnbc_with_retry(max_rounds=4) -> Tuple[float, str, str]:
     last_err = ""
     profiles = [
         (USER_AGENTS[0], {"width": 1366, "height": 768}),
@@ -256,9 +244,9 @@ def scrape_cnbc_with_retry(max_rounds=4) -> Tuple[float, str]:
             for ua, vp in profiles:
                 try:
                     print(f"[TRY] round={r} url={url} vp={vp['width']}x{vp['height']}")
-                    val = scrape_cnbc_once(url, ua, vp)
-                    print(f"[OK] cnbc price={val}")
-                    return val, "cnbc_playwright"
+                    val, trace = scrape_cnbc_once(url, ua, vp)
+                    print(f"[OK] cnbc price={val} trace={trace}")
+                    return val, "cnbc_playwright", trace
                 except Exception as e:
                     last_err = f"{url} | {vp} -> {e}"
                     print(f"[FAIL] {last_err}")
@@ -273,14 +261,15 @@ def scrape_cnbc_with_retry(max_rounds=4) -> Tuple[float, str]:
 # -------------------------
 # CSV append (safe + outlier guard)
 # -------------------------
-def append_csv(price: float, source: str):
+def append_csv(price: float, source: str, parse_trace: str):
     ensure_dirs()
 
-    columns = ["datetime_utc", "dxy_index", "source", "dxy_change_pct"]
+    columns = ["datetime_utc", "dxy_index", "source", "parse_trace", "dxy_change_pct"]
     row = {
         "datetime_utc": now_utc_str(),
         "dxy_index": float(price),
         "source": source,
+        "parse_trace": parse_trace,
         "dxy_change_pct": None,
     }
 
@@ -314,12 +303,15 @@ def append_csv(price: float, source: str):
         except Exception as e:
             print(f"[WARN] parse last datetime fail: {e}")
 
-    # outlier guard (30m jump too large)
+    # outlier guard vs previous row
     if len(df) > 0:
         try:
             prev = float(df.iloc[-1]["dxy_index"])
-            if abs(row["dxy_index"] - prev) > 3.0:
-                print(f"[WARN] Outlier detected prev={prev}, new={row['dxy_index']} -> skip")
+            if abs(row["dxy_index"] - prev) > MAX_DELTA_PER_RUN:
+                print(
+                    f"[WARN] Outlier detected prev={prev}, new={row['dxy_index']} "
+                    f"(>{MAX_DELTA_PER_RUN}) -> skip"
+                )
                 return
         except Exception:
             pass
@@ -359,16 +351,19 @@ def append_csv(price: float, source: str):
 if __name__ == "__main__":
     ensure_dirs()
 
+    # ensure CSV exists with header
     if not os.path.exists(CSV_PATH):
         pd.DataFrame(
-            columns=["datetime_utc", "dxy_index", "source", "dxy_change_pct"]
+            columns=["datetime_utc", "dxy_index", "source", "parse_trace", "dxy_change_pct"]
         ).to_csv(CSV_PATH, index=False)
 
     try:
-        price, source = scrape_cnbc_with_retry(max_rounds=4)
+        price, source, trace = scrape_cnbc_with_retry(max_rounds=4)
     except Exception as e:
         print("[WARN] CNBC failed -> fallback synthetic:", e)
         price = get_dxy_synthetic_from_fx()
         source = "synthetic_fx_fallback"
+        trace = "fallback:synthetic_fx"
 
-    append_csv(price, source)
+    print(f"[INFO] final_price={price} source={source} trace={trace}")
+    append_csv(price, source, trace)
