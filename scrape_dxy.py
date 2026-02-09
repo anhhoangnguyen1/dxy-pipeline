@@ -2,6 +2,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -22,6 +23,9 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
 ]
+
+# Vietnam timezone
+VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
 
 # -------------------------
@@ -45,8 +49,8 @@ def parse_float_safe(s: str) -> Optional[float]:
         return None
 
 
-def now_utc_str():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def now_vn_str():
+    return datetime.now(VN_TZ).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def save_debug(page, tag: str):
@@ -161,7 +165,7 @@ def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
             viewport=viewport,
             java_script_enabled=True,
             ignore_https_errors=True,
-            timezone_id="UTC",
+            timezone_id="Asia/Ho_Chi_Minh",  # đổi timezone context browser
         )
 
         context.add_init_script("""
@@ -276,9 +280,10 @@ def scrape_cnbc_with_retry(max_rounds=4) -> Tuple[float, str]:
 def append_csv(price: float, source: str):
     ensure_dirs()
 
+    # giữ tên cột cũ để không phá pipeline hiện tại
     columns = ["datetime_utc", "dxy_index", "source", "dxy_change_pct"]
     row = {
-        "datetime_utc": now_utc_str(),
+        "datetime_utc": now_vn_str(),  # giờ VN
         "dxy_index": float(price),
         "source": source,
         "dxy_change_pct": None,
@@ -303,14 +308,20 @@ def append_csv(price: float, source: str):
             df[c] = None
     df = df[columns]
 
-    # dedup 60s
+    # dedup 60s theo giờ VN
     if len(df) > 0 and pd.notna(df.iloc[-1]["datetime_utc"]):
         try:
-            last_dt = pd.to_datetime(df.iloc[-1]["datetime_utc"], utc=True)
-            now_dt = datetime.now(timezone.utc)
-            if abs((now_dt - last_dt.to_pydatetime()).total_seconds()) < 60:
-                print("SKIP duplicate < 60s")
-                return
+            last_dt = pd.to_datetime(df.iloc[-1]["datetime_utc"], errors="coerce")
+            if pd.notna(last_dt):
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.tz_localize(VN_TZ)
+                else:
+                    last_dt = last_dt.tz_convert(VN_TZ)
+
+                now_dt = datetime.now(VN_TZ)
+                if abs((now_dt - last_dt.to_pydatetime()).total_seconds()) < 60:
+                    print("SKIP duplicate < 60s")
+                    return
         except Exception as e:
             print(f"[WARN] parse last datetime fail: {e}")
 
@@ -336,12 +347,14 @@ def append_csv(price: float, source: str):
 
     row["dxy_change_pct"] = round(((row["dxy_index"] - ref) / ref) * 100.0, 6)
 
-    # append + sort
-    df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+    # append không dùng concat để tránh FutureWarning
+    df.loc[len(df)] = row
+
     try:
-        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
-        df = df.sort_values("datetime_utc").reset_index(drop=True)
-        df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        dt = pd.to_datetime(df["datetime_utc"], errors="coerce")
+        df["_sort_dt"] = dt
+        df = df.sort_values("_sort_dt").drop(columns=["_sort_dt"]).reset_index(drop=True)
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
     except Exception:
         pass
 
