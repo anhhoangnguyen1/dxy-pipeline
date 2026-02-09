@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import time
 from datetime import datetime, timezone
 from typing import Optional, Tuple
@@ -12,10 +11,8 @@ from playwright.sync_api import sync_playwright
 CSV_PATH = "data/dxy_history.csv"
 DEBUG_DIR = "debug"
 
-URLS = [
-    "https://www.investing.com/currencies/us-dollar-index",
-    "https://m.investing.com/currencies/us-dollar-index",
-]
+# CNBC ICE U.S. Dollar Index page
+URLS = ["https://www.cnbc.com/quotes/.DXY"]
 
 USER_AGENTS = [
     # desktop
@@ -26,12 +23,14 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
 ]
 
+
 # -------------------------
 # Helpers
 # -------------------------
 def ensure_dirs():
     os.makedirs("data", exist_ok=True)
     os.makedirs(DEBUG_DIR, exist_ok=True)
+
 
 def parse_float_safe(s: str) -> Optional[float]:
     if s is None:
@@ -45,8 +44,10 @@ def parse_float_safe(s: str) -> Optional[float]:
     except Exception:
         return None
 
+
 def now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
 
 def save_debug(page, tag: str):
     try:
@@ -57,15 +58,15 @@ def save_debug(page, tag: str):
     except Exception:
         pass
 
+
 # -------------------------
 # Fallback synthetic DXY
 # -------------------------
 def get_dxy_synthetic_from_fx() -> float:
     """
-    DXY synthetic:
+    Synthetic DXY:
       50.14348112 * (EURUSD^-0.576) * (USDJPY^0.136) * (GBPUSD^-0.119)
                   * (USDCAD^0.091) * (USDSEK^0.042) * (USDCHF^0.036)
-    Nguồn FX: open.er-api.com (base USD)
     """
     url = "https://open.er-api.com/v6/latest/USD"
     r = requests.get(url, timeout=30)
@@ -99,26 +100,46 @@ def get_dxy_synthetic_from_fx() -> float:
     )
     return round(dxy, 4)
 
+
 # -------------------------
-# Investing parse logic
+# CNBC extract logic
 # -------------------------
-def try_extract_from_text(text: str) -> Optional[float]:
+def try_extract_dxy_from_text_cnbc(text: str) -> Optional[float]:
+    """
+    Parse DXY from raw text/JSON/HTML by multiple patterns.
+    """
     patterns = [
-        r'data-test="instrument-price-last"[^>]*>\s*(?P<v>\d+(?:\.\d+)?)\s*<',
-        r'"last_price"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        # Most common key-value
         r'"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
-        r'"instrumentId"\s*:\s*8827.*?"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
-        r'"pid"\s*:\s*8827.*?"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"lastPrice"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"price"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"previousClosingPrice"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        # Specific fields that may appear in quote strip
+        r'data-testid="QuoteStrip-lastPrice"[^>]*>\s*(?P<v>\d+(?:\.\d+)?)\s*<',
+        r'data-testid="QuoteStrip-last"[^>]*>\s*(?P<v>\d+(?:\.\d+)?)\s*<',
+        # Sometimes with symbol context
+        r'"\.DXY"[^{}]{0,400}"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
     ]
+
     for pat in patterns:
         m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
         if m:
             v = parse_float_safe(m.group("v"))
-            if v is not None:
+            if v is not None and 50 <= v <= 150:
                 return round(v, 4)
+
+    # generic fallback: find all float-like numbers near DXY section
+    if ".DXY" in text or "Dollar Index" in text or "ICE U.S. Dollar Index" in text:
+        candidates = re.findall(r"\b(\d{2,3}\.\d{2,4})\b", text)
+        for c in candidates:
+            v = parse_float_safe(c)
+            if v is not None and 50 <= v <= 150:
+                return round(v, 4)
+
     return None
 
-def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
+
+def scrape_cnbc_once(url: str, user_agent: str, viewport: dict) -> float:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -139,7 +160,7 @@ def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
             timezone_id="UTC",
         )
 
-        # stealth nhẹ
+        # light stealth
         context.add_init_script("""
             Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US','en']});
@@ -149,7 +170,7 @@ def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
 
         page = context.new_page()
 
-        # block tài nguyên nặng (giữ script/xhr/css/document)
+        # block heavy resources (keep document/css/js/xhr/fetch)
         page.route(
             "**/*",
             lambda route: route.abort()
@@ -164,16 +185,10 @@ def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
                 ctype = (resp.headers or {}).get("content-type", "")
                 u = resp.url.lower()
 
-                if ("json" in ctype) or any(k in u for k in ["quotes", "chart", "stream", "api", "instrument"]):
+                # Catch likely quote/chart endpoints
+                if ("json" in ctype) or any(k in u for k in ["quote", "quotes", "chart", "graphql", "api"]):
                     txt = resp.text()
-                    # parse json/string đều thử regex
-                    try:
-                        obj = json.loads(txt)
-                        txt2 = json.dumps(obj)
-                    except Exception:
-                        txt2 = txt
-
-                    v = try_extract_from_text(txt2)
+                    v = try_extract_dxy_from_text_cnbc(txt)
                     if v is not None:
                         captured_prices.append(v)
             except Exception:
@@ -184,33 +199,36 @@ def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=120000)
         except Exception:
-            save_debug(page, "goto_fail")
+            save_debug(page, "cnbc_goto_fail")
             browser.close()
             raise
 
         page.wait_for_timeout(7000)
 
-        # 1) Ưu tiên response-captured
+        # 1) best source: captured from XHR/JSON
         if captured_prices:
             browser.close()
             return round(captured_prices[-1], 4)
 
         # 2) DOM selectors
         selectors = [
-            '[data-test="instrument-price-last"]',
-            'span[data-test="instrument-price-last"]',
-            'div[data-test="instrument-price-last"]',
-            'span[class*="instrument-price_last"]',
-            'span[class*="text-5xl"]',
-            'span[class*="pid-8827-last"]',
+            '[data-testid*="lastPrice"]',
+            '[data-testid*="QuoteStrip-lastPrice"]',
+            '[data-testid*="QuoteStrip-last"]',
+            'span[class*="QuoteStrip-lastPrice"]',
+            'div[class*="QuoteStrip-lastPrice"]',
+            # Generic large quote text in main area
+            "main h1 + div",
+            "main span",
         ]
+
         for sel in selectors:
             try:
                 loc = page.locator(sel).first
                 if loc.count() > 0:
-                    txt = loc.inner_text(timeout=3000)
+                    txt = loc.inner_text(timeout=2500)
                     v = parse_float_safe(txt)
-                    if v is not None:
+                    if v is not None and 50 <= v <= 150:
                         browser.close()
                         return round(v, 4)
             except Exception:
@@ -218,16 +236,17 @@ def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
 
         # 3) HTML regex fallback
         html = page.content()
-        v = try_extract_from_text(html)
+        v = try_extract_dxy_from_text_cnbc(html)
         if v is not None:
             browser.close()
             return v
 
-        save_debug(page, "parse_fail")
+        save_debug(page, "cnbc_parse_fail")
         browser.close()
-        raise RuntimeError("Không parse được DXY từ Investing trong lần thử này")
+        raise RuntimeError("Không parse được DXY từ CNBC trong lần thử này")
 
-def scrape_investing_with_retry(max_rounds=4) -> Tuple[float, str]:
+
+def scrape_cnbc_with_retry(max_rounds=4) -> Tuple[float, str]:
     last_err = ""
     profiles = [
         (USER_AGENTS[0], {"width": 1366, "height": 768}),
@@ -239,9 +258,9 @@ def scrape_investing_with_retry(max_rounds=4) -> Tuple[float, str]:
             for ua, vp in profiles:
                 try:
                     print(f"[TRY] round={r} url={url} vp={vp['width']}x{vp['height']}")
-                    val = scrape_investing_once(url, ua, vp)
-                    print(f"[OK] investing price={val}")
-                    return val, "investing_playwright"
+                    val = scrape_cnbc_once(url, ua, vp)
+                    print(f"[OK] cnbc price={val}")
+                    return val, "cnbc_playwright"
                 except Exception as e:
                     last_err = f"{url} | {vp} -> {e}"
                     print(f"[FAIL] {last_err}")
@@ -252,8 +271,9 @@ def scrape_investing_with_retry(max_rounds=4) -> Tuple[float, str]:
 
     raise RuntimeError(last_err)
 
+
 # -------------------------
-# CSV append (safe)
+# CSV append (safe, atomic)
 # -------------------------
 def append_csv(price: float, source: str):
     ensure_dirs()
@@ -266,7 +286,7 @@ def append_csv(price: float, source: str):
         "dxy_change_pct": None,
     }
 
-    # read safe
+    # Read safely
     if os.path.exists(CSV_PATH):
         try:
             if os.path.getsize(CSV_PATH) == 0:
@@ -279,13 +299,13 @@ def append_csv(price: float, source: str):
     else:
         df = pd.DataFrame(columns=columns)
 
-    # normalize columns
+    # Normalize columns
     for c in columns:
         if c not in df.columns:
             df[c] = None
     df = df[columns]
 
-    # dedup 60s
+    # Dedup 60s
     if len(df) > 0 and pd.notna(df.iloc[-1]["datetime_utc"]):
         try:
             last_dt = pd.to_datetime(df.iloc[-1]["datetime_utc"], utc=True)
@@ -296,7 +316,7 @@ def append_csv(price: float, source: str):
         except Exception as e:
             print(f"[WARN] parse last datetime fail: {e}")
 
-    # reference for pct
+    # Reference for change pct
     ref = 100.0
     if len(df) > 0:
         try:
@@ -308,7 +328,7 @@ def append_csv(price: float, source: str):
 
     row["dxy_change_pct"] = round(((row["dxy_index"] - ref) / ref) * 100.0, 6)
 
-    # append + sort
+    # Append + sort
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     try:
         df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
@@ -317,12 +337,13 @@ def append_csv(price: float, source: str):
     except Exception:
         pass
 
-    # atomic write
+    # Atomic write
     tmp = CSV_PATH + ".tmp"
     df.to_csv(tmp, index=False)
     os.replace(tmp, CSV_PATH)
 
     print("APPENDED:", row)
+
 
 # -------------------------
 # Main
@@ -330,14 +351,16 @@ def append_csv(price: float, source: str):
 if __name__ == "__main__":
     ensure_dirs()
 
-    # tạo file nếu chưa có (header chuẩn)
+    # Ensure CSV exists with header
     if not os.path.exists(CSV_PATH):
-        pd.DataFrame(columns=["datetime_utc", "dxy_index", "source", "dxy_change_pct"]).to_csv(CSV_PATH, index=False)
+        pd.DataFrame(
+            columns=["datetime_utc", "dxy_index", "source", "dxy_change_pct"]
+        ).to_csv(CSV_PATH, index=False)
 
     try:
-        price, source = scrape_investing_with_retry(max_rounds=4)
+        price, source = scrape_cnbc_with_retry(max_rounds=4)
     except Exception as e:
-        print("[WARN] Investing failed -> fallback synthetic:", e)
+        print("[WARN] CNBC failed -> fallback synthetic:", e)
         price = get_dxy_synthetic_from_fx()
         source = "synthetic_fx_fallback"
 
