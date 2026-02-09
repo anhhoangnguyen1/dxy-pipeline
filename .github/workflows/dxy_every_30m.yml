@@ -34,14 +34,31 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
+      - name: Ensure data/debug folders and CSV header
+        run: |
+          mkdir -p data debug
+          if [ ! -f data/dxy_history.csv ]; then
+            echo "datetime_utc,dxy_index,source,dxy_change_pct" > data/dxy_history.csv
+          fi
+
       - name: Run scraper
         run: python scrape_dxy.py
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxy-debug-${{ github.run_id }}
+          path: |
+            debug/*.html
+            debug/*.png
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Commit and push CSV (rebase-safe)
         shell: bash
         run: |
           set -e
-
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
@@ -59,7 +76,6 @@ jobs:
             BRANCH="main"
           fi
 
-          # retry push to avoid non-fast-forward/race
           for i in 1 2 3; do
             git pull --rebase origin "$BRANCH" || true
             if git push origin "HEAD:$BRANCH"; then
@@ -72,14 +88,3 @@ jobs:
 
           echo "Failed to push after 3 attempts."
           exit 1
-          
-      - name: Upload debug artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dxy-debug
-          path: |
-            debug/*.html
-            debug/*.png
-          if-no-files-found: ignore
-
