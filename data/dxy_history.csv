@@ -1,2 +1,3 @@
-datetime_utc,dxy_index,source,parse_trace,dxy_change_pct
-2026-02-09 10:06:28,97.359,cnbc_playwright,dom:text-near-last-label,-2.641
+datetime_utc,dxy_index,source,dxy_change_pct
+2026-02-09 10:06:28,97.359,cnbc_playwright,-2.641
+2026-02-09 10:10:50,97.336,cnbc_playwright,-0.023624
