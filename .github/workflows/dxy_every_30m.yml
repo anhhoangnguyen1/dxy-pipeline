@@ -1,0 +1,74 @@
+name: DXY Every 30m
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: dxy-pipeline-write
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Run scraper
+        run: python scrape_dxy.py
+
+      - name: Commit and push CSV (rebase-safe)
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add data/dxy_history.csv
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "update dxy history"
+
+          BRANCH="${GITHUB_REF_NAME}"
+          if [ -z "$BRANCH" ]; then
+            BRANCH="main"
+          fi
+
+          # retry push to avoid non-fast-forward/race
+          for i in 1 2 3; do
+            git pull --rebase origin "$BRANCH" || true
+            if git push origin "HEAD:$BRANCH"; then
+              echo "Push success on attempt $i"
+              exit 0
+            fi
+            echo "Push failed on attempt $i, retrying..."
+            sleep $((i * 5))
+          done
+
+          echo "Failed to push after 3 attempts."
+          exit 1
