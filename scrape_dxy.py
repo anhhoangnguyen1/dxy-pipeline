@@ -7,7 +7,7 @@ from typing import Optional, Tuple
 
 import pandas as pd
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import sync_playwright
 
 CSV_PATH = "data/dxy_history.csv"
 DEBUG_DIR = "debug"
@@ -26,6 +26,9 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36",
 ]
 
+# -------------------------
+# Helpers
+# -------------------------
 def ensure_dirs():
     os.makedirs("data", exist_ok=True)
     os.makedirs(DEBUG_DIR, exist_ok=True)
@@ -34,24 +37,35 @@ def parse_float_safe(s: str) -> Optional[float]:
     if s is None:
         return None
     s = s.strip().replace(",", "")
-    # lấy số đầu tiên dạng 97.40
     m = re.search(r"\d+(?:\.\d+)?", s)
     if not m:
         return None
     try:
         return float(m.group(0))
-    except:
+    except Exception:
         return None
 
 def now_utc_str():
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-# ---------- fallback synthetic ----------
+def save_debug(page, tag: str):
+    try:
+        html = page.content()
+        with open(os.path.join(DEBUG_DIR, f"last_page_{tag}.html"), "w", encoding="utf-8") as f:
+            f.write(html)
+        page.screenshot(path=os.path.join(DEBUG_DIR, f"last_screenshot_{tag}.png"), full_page=True)
+    except Exception:
+        pass
+
+# -------------------------
+# Fallback synthetic DXY
+# -------------------------
 def get_dxy_synthetic_from_fx() -> float:
     """
     DXY synthetic:
-    50.14348112 * (EURUSD^-0.576) * (USDJPY^0.136) * (GBPUSD^-0.119)
-                * (USDCAD^0.091) * (USDSEK^0.042) * (USDCHF^0.036)
+      50.14348112 * (EURUSD^-0.576) * (USDJPY^0.136) * (GBPUSD^-0.119)
+                  * (USDCAD^0.091) * (USDSEK^0.042) * (USDCHF^0.036)
+    Nguồn FX: open.er-api.com (base USD)
     """
     url = "https://open.er-api.com/v6/latest/USD"
     r = requests.get(url, timeout=30)
@@ -85,33 +99,26 @@ def get_dxy_synthetic_from_fx() -> float:
     )
     return round(dxy, 4)
 
-# ---------- Investing scrape ----------
-def try_extract_from_html(html: str) -> Optional[float]:
+# -------------------------
+# Investing parse logic
+# -------------------------
+def try_extract_from_text(text: str) -> Optional[float]:
     patterns = [
         r'data-test="instrument-price-last"[^>]*>\s*(?P<v>\d+(?:\.\d+)?)\s*<',
         r'"last_price"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
         r'"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
-        r'"pid"\s*:\s*8827.*?"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
         r'"instrumentId"\s*:\s*8827.*?"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
+        r'"pid"\s*:\s*8827.*?"last"\s*:\s*"?(?P<v>\d+(?:\.\d+)?)"?',
     ]
     for pat in patterns:
-        m = re.search(pat, html, flags=re.IGNORECASE | re.DOTALL)
+        m = re.search(pat, text, flags=re.IGNORECASE | re.DOTALL)
         if m:
-            val = parse_float_safe(m.group("v"))
-            if val is not None:
-                return round(val, 4)
+            v = parse_float_safe(m.group("v"))
+            if v is not None:
+                return round(v, 4)
     return None
 
-def save_debug(page, tag: str):
-    try:
-        html = page.content()
-        with open(os.path.join(DEBUG_DIR, f"last_page_{tag}.html"), "w", encoding="utf-8") as f:
-            f.write(html)
-        page.screenshot(path=os.path.join(DEBUG_DIR, f"last_screenshot_{tag}.png"), full_page=True)
-    except:
-        pass
-
-def scrape_investing_once(url: str, ua: str, viewport: dict) -> float:
+def scrape_investing_once(url: str, user_agent: str, viewport: dict) -> float:
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
@@ -124,7 +131,7 @@ def scrape_investing_once(url: str, ua: str, viewport: dict) -> float:
         )
 
         context = browser.new_context(
-            user_agent=ua,
+            user_agent=user_agent,
             locale="en-US",
             viewport=viewport,
             java_script_enabled=True,
@@ -142,7 +149,7 @@ def scrape_investing_once(url: str, ua: str, viewport: dict) -> float:
 
         page = context.new_page()
 
-        # block resource nặng, nhưng giữ XHR/fetch/script/css/doc
+        # block tài nguyên nặng (giữ script/xhr/css/document)
         page.route(
             "**/*",
             lambda route: route.abort()
@@ -150,45 +157,45 @@ def scrape_investing_once(url: str, ua: str, viewport: dict) -> float:
             else route.continue_(),
         )
 
-        # capture JSON/XHR có khả năng chứa giá
         captured_prices = []
 
         def on_response(resp):
             try:
                 ctype = (resp.headers or {}).get("content-type", "")
                 u = resp.url.lower()
-                if "json" in ctype or any(k in u for k in ["quotes", "chart", "stream", "api", "instrument"]):
+
+                if ("json" in ctype) or any(k in u for k in ["quotes", "chart", "stream", "api", "instrument"]):
                     txt = resp.text()
-                    # thử parse json trước
+                    # parse json/string đều thử regex
                     try:
                         obj = json.loads(txt)
                         txt2 = json.dumps(obj)
-                    except:
+                    except Exception:
                         txt2 = txt
-                    v = try_extract_from_html(txt2)
+
+                    v = try_extract_from_text(txt2)
                     if v is not None:
                         captured_prices.append(v)
-            except:
+            except Exception:
                 pass
 
         page.on("response", on_response)
 
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=120000)
-        except Exception as e:
+        except Exception:
             save_debug(page, "goto_fail")
             browser.close()
             raise
 
-        # đợi network thêm chút
         page.wait_for_timeout(7000)
 
-        # 1) ưu tiên giá bắt từ response json/xhr
+        # 1) Ưu tiên response-captured
         if captured_prices:
             browser.close()
             return round(captured_prices[-1], 4)
 
-        # 2) parse DOM selectors
+        # 2) DOM selectors
         selectors = [
             '[data-test="instrument-price-last"]',
             'span[data-test="instrument-price-last"]',
@@ -202,28 +209,26 @@ def scrape_investing_once(url: str, ua: str, viewport: dict) -> float:
                 loc = page.locator(sel).first
                 if loc.count() > 0:
                     txt = loc.inner_text(timeout=3000)
-                    val = parse_float_safe(txt)
-                    if val is not None:
+                    v = parse_float_safe(txt)
+                    if v is not None:
                         browser.close()
-                        return round(val, 4)
-            except:
+                        return round(v, 4)
+            except Exception:
                 pass
 
-        # 3) parse HTML raw
+        # 3) HTML regex fallback
         html = page.content()
-        v = try_extract_from_html(html)
+        v = try_extract_from_text(html)
         if v is not None:
             browser.close()
             return v
 
-        # fail -> lưu debug
         save_debug(page, "parse_fail")
         browser.close()
         raise RuntimeError("Không parse được DXY từ Investing trong lần thử này")
 
 def scrape_investing_with_retry(max_rounds=4) -> Tuple[float, str]:
     last_err = ""
-    # luân phiên cấu hình desktop/mobile
     profiles = [
         (USER_AGENTS[0], {"width": 1366, "height": 768}),
         (USER_AGENTS[1], {"width": 412, "height": 915}),
@@ -235,58 +240,100 @@ def scrape_investing_with_retry(max_rounds=4) -> Tuple[float, str]:
                 try:
                     print(f"[TRY] round={r} url={url} vp={vp['width']}x{vp['height']}")
                     val = scrape_investing_once(url, ua, vp)
+                    print(f"[OK] investing price={val}")
                     return val, "investing_playwright"
                 except Exception as e:
                     last_err = f"{url} | {vp} -> {e}"
-                    print("[FAIL]", last_err)
+                    print(f"[FAIL] {last_err}")
+
         sleep_s = 4 * r
         print(f"[WAIT] {sleep_s}s")
         time.sleep(sleep_s)
 
     raise RuntimeError(last_err)
 
-# ---------- CSV ----------
+# -------------------------
+# CSV append (safe)
+# -------------------------
 def append_csv(price: float, source: str):
     ensure_dirs()
+
+    columns = ["datetime_utc", "dxy_index", "source", "dxy_change_pct"]
     row = {
         "datetime_utc": now_utc_str(),
-        "dxy_index": price,
+        "dxy_index": float(price),
         "source": source,
         "dxy_change_pct": None,
     }
 
+    # read safe
     if os.path.exists(CSV_PATH):
-        df = pd.read_csv(CSV_PATH)
+        try:
+            if os.path.getsize(CSV_PATH) == 0:
+                df = pd.DataFrame(columns=columns)
+            else:
+                df = pd.read_csv(CSV_PATH)
+        except Exception as e:
+            print(f"[WARN] CSV lỗi/rỗng -> reset dataframe. reason={e}")
+            df = pd.DataFrame(columns=columns)
     else:
-        df = pd.DataFrame(columns=["datetime_utc", "dxy_index", "source", "dxy_change_pct"])
+        df = pd.DataFrame(columns=columns)
+
+    # normalize columns
+    for c in columns:
+        if c not in df.columns:
+            df[c] = None
+    df = df[columns]
 
     # dedup 60s
-    if len(df) > 0:
+    if len(df) > 0 and pd.notna(df.iloc[-1]["datetime_utc"]):
         try:
             last_dt = pd.to_datetime(df.iloc[-1]["datetime_utc"], utc=True)
             now_dt = datetime.now(timezone.utc)
             if abs((now_dt - last_dt.to_pydatetime()).total_seconds()) < 60:
                 print("SKIP duplicate < 60s")
                 return
-        except:
-            pass
+        except Exception as e:
+            print(f"[WARN] parse last datetime fail: {e}")
 
+    # reference for pct
     ref = 100.0
     if len(df) > 0:
         try:
             prev = float(df.iloc[-1]["dxy_index"])
             if prev > 0:
                 ref = prev
-        except:
+        except Exception:
             pass
 
-    row["dxy_change_pct"] = round(((price - ref) / ref) * 100.0, 6)
+    row["dxy_change_pct"] = round(((row["dxy_index"] - ref) / ref) * 100.0, 6)
+
+    # append + sort
     df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-    df.to_csv(CSV_PATH, index=False)
+    try:
+        df["datetime_utc"] = pd.to_datetime(df["datetime_utc"], utc=True, errors="coerce")
+        df = df.sort_values("datetime_utc").reset_index(drop=True)
+        df["datetime_utc"] = df["datetime_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+
+    # atomic write
+    tmp = CSV_PATH + ".tmp"
+    df.to_csv(tmp, index=False)
+    os.replace(tmp, CSV_PATH)
+
     print("APPENDED:", row)
 
+# -------------------------
+# Main
+# -------------------------
 if __name__ == "__main__":
     ensure_dirs()
+
+    # tạo file nếu chưa có (header chuẩn)
+    if not os.path.exists(CSV_PATH):
+        pd.DataFrame(columns=["datetime_utc", "dxy_index", "source", "dxy_change_pct"]).to_csv(CSV_PATH, index=False)
+
     try:
         price, source = scrape_investing_with_retry(max_rounds=4)
     except Exception as e:
