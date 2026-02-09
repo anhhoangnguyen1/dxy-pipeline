@@ -325,7 +325,7 @@ def append_csv(price: float, source: str):
             pass
 
     # reference for change pct
-    ref = 100.0
+    ref = 97.324
     if len(df) > 0:
         try:
             prev = float(df.iloc[-1]["dxy_index"])
